@@ -1,15 +1,18 @@
 from copy import deepcopy
+import re
 import warnings
 from lxml.etree import Element
 from lxml import etree
 from zipfile import ZipFile, ZIP_DEFLATED
-import shlex
-
+from random import randint
 
 NAMESPACES = {
     'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
     'mc': 'http://schemas.openxmlformats.org/markup-compatibility/2006',
     'ct': 'http://schemas.openxmlformats.org/package/2006/content-types',
+    'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
+    'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+    'pic': 'http://schemas.openxmlformats.org/drawingml/2006/picture',
 }
 
 CONTENT_TYPES_PARTS = (
@@ -27,6 +30,12 @@ class MailMerge(object):
         self.parts = {}
         self.settings = None
         self._settings_info = None
+
+        self.media = {}         # new images to add indexed by embed id
+        self.rels = None        # etree for relationships
+        self._rels_info = None  # zi info block for rels
+        self.RELS_NAMESPACES = {'ns': None, 'od': None}
+
         self.remove_empty_tables = remove_empty_tables
 
         try:
@@ -38,8 +47,16 @@ class MailMerge(object):
                 elif type == CONTENT_TYPE_SETTINGS:
                     self._settings_info, self.settings = self.__get_tree_of_file(file)
 
+            # get the rels for image mappings
+            try:
+                self._rels_info, self.rels = self.__get_tree_of_file('word/_rels/document.xml.rels')
+                self.RELS_NAMESPACES['ns'] = self.rels.getroot().nsmap.get(None)
+                self.RELS_NAMESPACES['od'] = self.rels.getroot().nsmap.get(None).replace('package', 'officeDocument')
+            except:
+                pass
             to_delete = []
 
+            r = re.compile(r' MERGEFIELD +"?([^ ]+?)"? +(|\\\* MERGEFORMAT )', re.I)
             for part in self.parts.values():
 
                 for parent in part.findall('.//{%(w)s}fldSimple/..' % NAMESPACES):
@@ -48,10 +65,10 @@ class MailMerge(object):
                             continue
                         instr = child.attrib['{%(w)s}instr' % NAMESPACES]
 
-                        name = self.__parse_instr(instr)
-                        if name is None:
+                        m = r.match(instr)
+                        if m is None:
                             continue
-                        parent[idx] = Element('MergeField', name=name)
+                        parent[idx] = Element('MergeField', name=m.group(1))
 
                 for parent in part.findall('.//{%(w)s}instrText/../..' % NAMESPACES):
                     children = list(parent)
@@ -80,11 +97,10 @@ class MailMerge(object):
                         for instr in instr_elements[1:]:
                             instr.getparent().remove(instr)
 
-                        name = self.__parse_instr(instr_text)
-                        if name is None:
+                        m = r.match(instr_text)
+                        if m is None:
                             continue
-
-                        parent[idx_begin] = Element('MergeField', name=name)
+                        parent[idx_begin] = Element('MergeField', name=m.group(1))
 
                         # use this so we know *where* to put the replacement
                         instr_elements[0].tag = 'MergeText'
@@ -108,18 +124,11 @@ class MailMerge(object):
             self.zip.close()
             raise
 
-    @classmethod
-    def __parse_instr(cls, instr):
-        args = shlex.split(instr, posix=False)
-        if args[0] != 'MERGEFIELD':
-            return None
-        name = args[1]
-        if name[0] == '"' and name[-1] == '"':
-            name = name[1:-1]
-        return name
-
     def __get_tree_of_file(self, file):
-        fn = file.attrib['PartName' % NAMESPACES].split('/', 1)[1]
+        if isinstance(file, etree._Element):
+            fn = file.get('PartName').split('/', 1)[1]
+        else:
+            fn = file
         zi = self.zip.getinfo(fn)
         return zi, etree.parse(self.zip.open(zi))
 
@@ -136,8 +145,14 @@ class MailMerge(object):
                 elif zi == self._settings_info:
                     xml = etree.tostring(self.settings.getroot())
                     output.writestr(zi.filename, xml)
+                elif zi == self._rels_info:
+                    xml = etree.tostring(self.rels.getroot())
+                    output.writestr(zi.filename, xml)
                 else:
                     output.writestr(zi.filename, self.zip.read(zi))
+            # add new images to media folder is we have images merged
+            for img_id, img_data in self.media.items():
+                output.writestr('media/{}.png'.format(img_id), img_data)
 
     def get_merge_fields(self, parts=None):
         if not parts:
@@ -152,7 +167,7 @@ class MailMerge(object):
         """
         Duplicate template. Creates a copy of the template, does a merge, and separates them by a new paragraph, a new break or a new section break.
         separator must be :
-        - page_break : Page Break. 
+        - page_break : Page Break.
         - column_break : Column Break. ONLY HAVE EFFECT IF DOCUMENT HAVE COLUMNS
         - textWrapping_break : Line Break.
         - continuous_section : Continuous section break. Begins the section on the next paragraph.
@@ -162,58 +177,58 @@ class MailMerge(object):
         - oddPage_section : oddPage section break. section begins on the next odd-numbered page, leaving the next even page blank if necessary.
         """
 
-        #TYPE PARAM CONTROL AND SPLIT
-        valid_separators = {'page_break', 'column_break', 'textWrapping_break', 'continuous_section', 'evenPage_section', 'nextColumn_section', 'nextPage_section', 'oddPage_section'}
+        # TYPE PARAM CONTROL AND SPLIT
+        valid_separators = {'page_break', 'column_break', 'textWrapping_break', 'continuous_section',
+                            'evenPage_section', 'nextColumn_section', 'nextPage_section', 'oddPage_section'}
         if not separator in valid_separators:
             raise ValueError("Invalid separator argument")
         type, sepClass = separator.split("_")
-  
 
-        #GET ROOT - WORK WITH DOCUMENT
+        # GET ROOT - WORK WITH DOCUMENT
         for part in self.parts.values():
             root = part.getroot()
             tag = root.tag
             if tag == '{%(w)s}ftr' % NAMESPACES or tag == '{%(w)s}hdr' % NAMESPACES:
                 continue
-		
+
             if sepClass == 'section':
 
-                #FINDING FIRST SECTION OF THE DOCUMENT
+                # FINDING FIRST SECTION OF THE DOCUMENT
                 firstSection = root.find("w:body/w:p/w:pPr/w:sectPr", namespaces=NAMESPACES)
                 if firstSection == None:
                     firstSection = root.find("w:body/w:sectPr", namespaces=NAMESPACES)
-			
-                #MODIFY TYPE ATTRIBUTE OF FIRST SECTION FOR MERGING
+
+                # MODIFY TYPE ATTRIBUTE OF FIRST SECTION FOR MERGING
                 nextPageSec = deepcopy(firstSection)
                 for child in nextPageSec:
-                #Delete old type if exist
+                    # Delete old type if exist
                     if child.tag == '{%(w)s}type' % NAMESPACES:
                         nextPageSec.remove(child)
-                #Create new type (def parameter)
-                newType = etree.SubElement(nextPageSec, '{%(w)s}type'  % NAMESPACES)
-                newType.set('{%(w)s}val'  % NAMESPACES, type)
+                # Create new type (def parameter)
+                newType = etree.SubElement(nextPageSec, '{%(w)s}type' % NAMESPACES)
+                newType.set('{%(w)s}val' % NAMESPACES, type)
 
-                #REPLACING FIRST SECTION
+                # REPLACING FIRST SECTION
                 secRoot = firstSection.getparent()
                 secRoot.replace(firstSection, nextPageSec)
 
-            #FINDING LAST SECTION OF THE DOCUMENT
+            # FINDING LAST SECTION OF THE DOCUMENT
             lastSection = root.find("w:body/w:sectPr", namespaces=NAMESPACES)
 
-            #SAVING LAST SECTION
+            # SAVING LAST SECTION
             mainSection = deepcopy(lastSection)
             lsecRoot = lastSection.getparent()
             lsecRoot.remove(lastSection)
 
-            #COPY CHILDREN ELEMENTS OF BODY IN A LIST
+            # COPY CHILDREN ELEMENTS OF BODY IN A LIST
             childrenList = root.findall('w:body/*', namespaces=NAMESPACES)
 
-            #DELETE ALL CHILDREN OF BODY
+            # DELETE ALL CHILDREN OF BODY
             for child in root:
                 if child.tag == '{%(w)s}body' % NAMESPACES:
                     child.clear()
 
-            #REFILL BODY AND MERGE DOCS - ADD LAST SECTION ENCAPSULATED OR NOT
+            # REFILL BODY AND MERGE DOCS - ADD LAST SECTION ENCAPSULATED OR NOT
             lr = len(replacements)
             lc = len(childrenList)
             parts = []
@@ -231,13 +246,13 @@ class MailMerge(object):
                                 else:
                                     if sepClass == 'section':
                                         intSection = deepcopy(mainSection)
-                                        p   = etree.SubElement(child, '{%(w)s}p'  % NAMESPACES)
-                                        pPr = etree.SubElement(p, '{%(w)s}pPr'  % NAMESPACES)
+                                        p = etree.SubElement(child, '{%(w)s}p' % NAMESPACES)
+                                        pPr = etree.SubElement(p, '{%(w)s}pPr' % NAMESPACES)
                                         pPr.append(intSection)
                                         parts.append(p)
                                     elif sepClass == 'break':
-                                        pb   = etree.SubElement(child, '{%(w)s}p'  % NAMESPACES)
-                                        r = etree.SubElement(pb, '{%(w)s}r'  % NAMESPACES)
+                                        pb = etree.SubElement(child, '{%(w)s}p' % NAMESPACES)
+                                        r = etree.SubElement(pb, '{%(w)s}r' % NAMESPACES)
                                         nbreak = Element('{%(w)s}br' % NAMESPACES)
                                         nbreak.attrib['{%(w)s}type' % NAMESPACES] = type
                                         r.append(nbreak)
@@ -245,13 +260,13 @@ class MailMerge(object):
                     self.merge(parts, **repl)
 
     def merge_pages(self, replacements):
-         """
-         Deprecated method.
-         """
-         warnings.warn("merge_pages has been deprecated in favour of merge_templates",
+        """
+        Deprecated method.
+        """
+        warnings.warn("merge_pages has been deprecated in favour of merge_templates",
                       category=DeprecationWarning,
-                      stacklevel=2)         
-         self.merge_templates(replacements, "page_break")
+                      stacklevel=2)
+        self.merge_templates(replacements, "page_break")
 
     def merge(self, parts=None, **replacements):
         if not parts:
@@ -265,6 +280,33 @@ class MailMerge(object):
                     self.__merge_field(part, field, replacement)
 
     def __merge_field(self, part, field, text):
+        if field.startswith('IMAGE:'):
+            _, img_name = field.split(':')
+            inline_img_el = part.find('.//wp:docPr[@title="{}"]/..'.format(img_name), namespaces=NAMESPACES)
+            if inline_img_el:
+                embed_node = inline_img_el.find('.//a:blip', namespaces=NAMESPACES)
+                if embed_node:
+                    # generate a random id and add tp media list for later export to media folder in zip file
+                    img_id = 'MMR{}'.format(randint(10000000, 999999999))
+                    self.media[img_id] = text
+
+                    # add a relationship
+                    last_img_relationship = \
+                    self.rels.findall('{%(ns)s}Relationship[@Type="%(od)s/image"]' % self.RELS_NAMESPACES)[-1]
+                    new_img_relationship = deepcopy(last_img_relationship)
+                    new_img_relationship.set('Id', img_id)
+                    new_img_relationship.set('Target', '/media/{}.png'.format(img_id))
+                    self.rels.getroot().append(new_img_relationship)
+
+                    # replace the embed attrib with the new image_id
+                    embed_node = inline_img_el.find('.//a:blip', namespaces=NAMESPACES)
+                    embed_attr = embed_node.attrib.keys()[0]
+                    embed_node.attrib[embed_attr] = img_id
+                # mark as done
+                inline_img_el.find('wp:docPr', namespaces=NAMESPACES).attrib['title'] = 'replaced_image_{}'.format(
+                    img_id)
+            return
+
         for mf in part.findall('.//MergeField[@name="%s"]' % field):
             children = list(mf)
             mf.clear()  # clear away the attributes
@@ -274,7 +316,7 @@ class MailMerge(object):
             nodes = []
             # preserve new lines in replacement text
             text = text or ''  # text might be None
-            text_parts = str(text).replace('\r', '').split('\n')
+            text_parts = text.replace('\r', '').split('\n')
             for i, text_part in enumerate(text_parts):
                 text_node = Element('{%(w)s}t' % NAMESPACES)
                 text_node.text = text_part
